@@ -1,0 +1,163 @@
+##Code to import data, merge category hierarchy with the transactions fle and run Time Series Analysis
+
+library(data.table)
+library(lubridate)
+library(plyr)
+library(sqldf)
+library(forecast)
+
+#Read Files
+Prices=data.table(read.csv("Prices.csv",stringsAsFactors = F))
+setkey(Prices,ART_NO)
+articles=data.table(read.csv("articles.csv",stringsAsFactors = FALSE))
+setkey(articles,ART_NO)
+articles_2=merge(articles,Prices,all.x = TRUE)
+S290L=data.table(read.csv("S290L_1.csv",stringsAsFactors = F))
+setkey(articles_2,ART_NO)
+setkey(S290L,ART_NO)
+
+#Inner Join
+merged_data=S290L[articles_2,nomatch=0]
+
+#Remove Online
+merged_data=subset(merged_data,merged_data$Channel==1)
+
+#new_merged=merged_data[,c(1,2,3,4,5,8,9,10,11,12,13,14,28,30,31,32,33,34)]
+
+#new_merged=merged_data[,c(1,2,3,4,5,7,8,9,10,11,12)]
+new_merged=merged_data[,c(1,2,3,6,7,8,9,10,12,35),with=F]
+
+remove(merged_data,S290L,articles)
+
+head(new_merged)
+
+new_merged$Date=lubridate::as_date(new_merged$Date)
+#new_merged$year=year(new_2$Date)
+
+a=names(new_merged)
+a[6]="HFB_y"
+names(new_merged)=a
+
+daily=sqldf::sqldf("select Date,Fam_ID,HFB_y,RA,PA,ART_NO,count(Date) as Sales_Volume,sum(PRICE) as Price from new_merged group by Date,ART_NO,Fam_ID,HFB_y,RA,PA")
+
+#daily_try=sqldf::sqldf("select Date,Fam_ID,HFB_y,RA,PA,ART_NO,count(Date) from new_merged group by Date,Fam_ID,HFB_y,RA,PA,ART_NO")
+
+###Write CSV Files
+#write.csv(daily,"daily_new.csv",row.names = F)
+#write.csv(Monthly,"Monthly_new.csv",row.names = F)
+#write.csv(plants,"plants.csv",row.names = F)
+
+#Add Month and Year to Daily
+daily$Month=lubridate::month(daily$Date)
+daily$Year=lubridate::year(daily$Date)
+
+#Aggregate to Monthly
+Monthly=ddply(daily,c("Year","Month","HFB_y","RA","PA","ART_NO"),summarise,Volume=sum(Sales_Volume),Price=mean(Price))
+Monthly$Month=month.abb[Monthly$Month]
+
+#calculate Value of Products Sold
+Monthly$Sales=Monthly$Volume*Monthly$Price
+
+#Filtering out only Plants
+
+plants=subset(Monthly,Monthly$PA=="Plants")
+
+#Add Month and Year to Plants
+plants$Month=lubridate::month(plants$Date)
+plants$Year=lubridate::year(plants$Date)
+
+#calculate Value of Products Sold
+plants$Sales=plants$Sales_Volume*plants$Price
+
+#Extract First Two Years
+plants_train=subset(plants,plants$Date<as.Date("2015-01-01","%Y-%m-%d"))
+
+#Aggregate to Month
+plants_month=ddply(plants_train,c("Year","Month"),summarise,Volume=sum(Sales_Volume),Value=sum(Sales))
+plants_month$Month=month.abb[plants_month$Month]
+
+
+#Covert to Timeseries
+Value=plants_month$Value
+Volume=plants_month$Volume
+
+Value=ts(Value,start = c(2013,1),frequency = 12)
+Volume=ts(Volume,start = c(2013,1),frequency = 12)
+
+#Try ARIMA
+arima=auto.arima(Volume,start.q = 1)
+future=forecast(arima,12)
+plot(future)
+
+dataset=Volume
+nforecast=12
+
+#models Used
+Output=data.frame(matrix(NA,nrow=9,ncol=12))
+names(Output)=paste(month.abb[1:12],2015:2016)
+
+#ARIMA
+Output[1,] = pmax(forecast(auto.arima(dataset,max.p=2,max.q=2,max.d=1,max.P=1,max.Q=1,max.D=1),h=nforecast)$mean,0)
+
+
+#Holt Winters
+Output[2,]= pmax(forecast(hw(dataset,h=nforecast),h=nforecast)$mean,0)
+
+
+#Exponential Smoothing
+Output[3,] = pmax(forecast(ets(dataset),nforecast)$mean-1,0)
+
+#ARIMA Log
+Output[4,] = pmax(exp(forecast(auto.arima(log(dataset+1),max.p=2,max.q=2,max.d=1,max.P=1,max.Q=1,max.D=1),nforecast)$mean)-1,0)
+
+#Seasonal Naive
+Output[5,] = pmax(forecast(snaive(dataset,h=nforecast),h=nforecast)$mean,0)
+
+#Naive with Drift
+Output[6,] = pmax(forecast(rwf(dataset,h=nforecast,drift=T),h=nforecast)$mean,0)
+
+#Average Model
+Output[7,]= pmax(forecast(meanf(dataset,h=nforecast),h=nforecast)$mean,0)
+
+# TBATS - 12 Months & 24 Months
+Output[8,] = pmax(forecast(tbats(dataset,use.parallel=T,seasonal.period=c(4,8)),h=nforecast)$mean,0)
+
+# TBATS2 - 6 Months & 12 Months
+Output[9,]= pmax(forecast(tbats(dataset,use.parallel=T,seasonal.period=c(2,4)),h=nforecast)$mean,0)
+
+Models=c("ARIMA","Holt-Winters","Exponential-Smoothing","ARIMA-Log","Seasonal-Naive","Naive-Drift","Average","T-Bats","Tbats2")
+Output$Models=Models
+
+
+# Plot the series Forecsts
+#ARIMA
+plot(forecast(auto.arima(dataset,max.p=2,max.q=2,max.d=1,max.P=1,max.Q=1,max.D=1),h=nforecast))
+
+#Holt Winters
+plot(forecast(hw(dataset,h=nforecast),h=nforecast))
+
+#Exponential Smoothing
+plot(forecast(ets(dataset),nforecast))
+
+#ARIMA Log
+plot(exp(forecast(auto.arima(log(dataset),max.p=2,max.q=2,max.d=1,max.P=1,max.Q=1,max.D=1),nforecast)))
+
+#Seasonal Naive
+plot(forecast(snaive(dataset,h=nforecast),h=nforecast))
+
+#Naive with Drift
+plot(forecast(rwf(dataset,h=nforecast,drift=T),h=nforecast))
+
+#Average Model
+plot(forecast(meanf(dataset,h=nforecast),h=nforecast))
+
+# TBATS - 12 Months & 24 Months
+plot(forecast(tbats(dataset,use.parallel=T,seasonal.period=c(4,8)),h=nforecast))
+
+# TBATS2 - 6 Months & 12 Months
+plot(forecast(tbats(dataset,use.parallel=T,seasonal.period=c(2,4)),h=nforecast))
+
+
+#Calculate In-Sample Accuracy
+accuracy(hw(dataset))
+accuracy(snaive(dataset))
